@@ -4,7 +4,7 @@
 #include <unistd.h>
 #include <iostream>
 #include <unordered_set>
-#include <unordered_map>
+#include <map>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
 #include <fcntl.h>
@@ -16,20 +16,29 @@
 using namespace std;
 
 struct Task {
+    size_t taskId;
     double l;
     double r;
+};
+
+struct TaskResult {
+    size_t taskId;
+    double result;
 };
 
 using TimeType = chrono::time_point<chrono::high_resolution_clock>;
 struct WorkerState {
     unordered_set<size_t> tasksIds;
     TimeType lastHeartbeat;
+    int tcpSock;
+    struct sockaddr_in addressForTcp;
 };
 
 size_t tasksCount = 0;
 double l;
 double r;
-unordered_map<string, WorkerState> workersStates;
+using Address = pair<string, uint16_t>;
+map<Address, WorkerState> workersStates;
 const size_t PORT = 12345;
 const size_t MAX_EVENTS = 100;
 const size_t BUFFER_SIZE = 1024; // а больше не надо? что будет если не хватит на одно сообщение?
@@ -39,6 +48,8 @@ double workersConnectionWaitingTime = healthCheckPeriod / 2;
 TimeType lastHealthCheckTime;
 const int EPOLL_WAIT_TIMEOUT_MS = 500;
 bool taskSplitted = false;
+unordered_set<size_t> completedTasks;
+double totalResult = 0;
 
 int SetNonblocking(int sockfd) {
     int flags, s;
@@ -82,7 +93,7 @@ int CreateAndBindUdp(int port) {
     return sockfd;
 }
 
-int CreateAndBindTcp(int port) {
+int CreateAndBindTcp(int port) { // TODO удалить либо это, либо SetTcpConnectionWithWorker
     int sockfd;
     struct sockaddr_in server_addr;
 
@@ -112,38 +123,66 @@ int CreateAndBindTcp(int port) {
     return sockfd;
 }
 
-void SetTcpConnectionWithWorkek(const string& workerAddress) {
-    // TODO
-}
+bool SetTcpConnectionWithWorker(const Address& workerAddress) {
+    auto& workerState = workersStates[workerAddress];
+    workerState.tcpSock = socket(AF_INET, SOCK_STREAM, 0);
+    if (workerState.tcpSock < 0) {
+        perror("Socket creation failed");
+        exit(1);
+    }
 
-void AssignAndSendTaskToWorker(const string& workerAddress, size_t taskId) {
-    workersStates[workerAddress].tasksIds.insert(taskId);
-    // TODO send
+    workerState.addressForTcp.sin_family = AF_INET;
+    workerState.addressForTcp.sin_addr.s_addr = inet_addr(workerAddress.first.data());
+    workerState.addressForTcp.sin_port = htons(workerAddress.second);
+
+    if (connect(workerState.tcpSock, (struct sockaddr*)&workerState.addressForTcp, sizeof(workerState.addressForTcp)) < 0) {
+        workerState.lastHeartbeat = chrono::time_point<chrono::high_resolution_clock>();
+        // close(workerState.tcpSock);
+        return false;
+    }
+    return true;
 }
 
 Task GetSubInterval(size_t i) {
     if (tasksCount == 0) {
         return {0, 0};
     }
-    return {l + (r - l) / tasksCount * i, l + (r - l) / tasksCount * (i + 1)};
+    return {i, l + (r - l) / tasksCount * i, l + (r - l) / tasksCount * (i + 1)};
+}
+
+void AssignAndSendTaskToWorker(const Address& workerAddress, size_t taskId) {
+    auto& workerState = workersStates[workerAddress];
+    workerState.tasksIds.insert(taskId);
+    
+    auto task = GetSubInterval(taskId);
+    cerr << "\tCalling send..." << endl;
+    if (send(workerState.tcpSock, &task, sizeof(task), 0) < 0) {
+        perror("Send failed");
+        // exit(1);
+    }
 }
 
 double DiffBetweenTimestamps(const TimeType& a, const TimeType& b) {
-    assert(a > b);
+    assert(a <= b);
     return (chrono::duration<double>(b - a)).count();
 }
 
 void TryToCreateSubtasks(const TimeType& timeOfBroadcast, const TimeType& currentTime) {
-    cout << DiffBetweenTimestamps(timeOfBroadcast, currentTime) << endl;
+    cout << "TryToCreateSubtasks: diff: " << DiffBetweenTimestamps(timeOfBroadcast, currentTime) << endl;
+    cout << "\tworkersStates.size(): " << workersStates.size() << endl;
     if (workersStates.empty()) {
-        workersConnectionWaitingTime *= 2;
+        workersConnectionWaitingTime += 10;
+        cerr << "0 workers available, increased timeout to " << workersConnectionWaitingTime << " seconds" << endl;
     } else {
         tasksCount = workersStates.size();
         taskSplitted = true;
         size_t i = 0;
         for (auto& [worker, state] : workersStates) {
-            SetTcpConnectionWithWorkek(worker);
-            AssignAndSendTaskToWorker(worker, i++);
+            if (SetTcpConnectionWithWorker(worker)) {
+                cerr << "\tSetTcpConnectionWithWorker finished" << endl;
+                AssignAndSendTaskToWorker(worker, i++);
+                cerr << "\tAssignAndSendTaskToWorker finished" << endl;
+            }
         }
     }
 }
@@ -151,11 +190,11 @@ void TryToCreateSubtasks(const TimeType& timeOfBroadcast, const TimeType& curren
 void DoHealthCheck() {
     auto currentTime = chrono::high_resolution_clock::now();
     lastHealthCheckTime = currentTime;
-    vector<string> aliveWorkersAddresses;
+    vector<Address> aliveWorkersAddresses;
     vector<size_t> tasksToReassign;
     for (auto& [workerAddress, state] : workersStates) {
         if (DiffBetweenTimestamps(state.lastHeartbeat, currentTime) > healthCheckPeriod) {
-            cerr << "Dead: " << workerAddress << std::endl;
+            cerr << "Dead: " << workerAddress.first << ":" << workerAddress.second << std::endl;
             tasksToReassign.insert(
                 tasksToReassign.begin(),
                 make_move_iterator(state.tasksIds.begin()),
@@ -163,7 +202,7 @@ void DoHealthCheck() {
             );
             state.tasksIds.clear();
         } else {
-            cerr << "Alive: " << workerAddress << std::endl;
+            cerr << "Alive: " << workerAddress.first << ":" << workerAddress.second << std::endl;
             aliveWorkersAddresses.push_back(workerAddress);
         }
     }
@@ -181,10 +220,20 @@ void DoHealthCheck() {
     }
 }
 
+void CompleteTask(TaskResult result) {
+    if (completedTasks.insert(result.taskId).second) {
+        totalResult += result.result;
+        if (completedTasks.size() == tasksCount) {
+            cout << "Result: " << totalResult << endl;
+            exit(0);
+        }
+    }
+}
+
 int main() {
     cin >> l >> r;
     if (l > r) {
-        cerr << "l must be not more than r";
+        cerr << "l must be not more than r" << endl;
         exit(1);
     }
 
@@ -192,14 +241,12 @@ int main() {
     // workersStates = {"1.2.3.4:5555", "5.6.7.8:5555", "9.10.11.12:5555"};
     const auto timeOfBroadcast = chrono::high_resolution_clock::now();
 
-    int udp_sock, tcp_sock, conn_sock;
+    int udp_sock;
     udp_sock = CreateAndBindUdp(PORT);
-    tcp_sock = CreateAndBindTcp(PORT);
     SetNonblocking(udp_sock);
-    SetNonblocking(tcp_sock);
 
-    int epoll_fd = epoll_create1(0);
-    if (epoll_fd == -1) {
+    int epollFd = epoll_create1(0);
+    if (epollFd == -1) {
         perror("epoll_create1");
         exit(1);
     }
@@ -208,23 +255,16 @@ int main() {
     
     ev.events = EPOLLIN;
     ev.data.fd = udp_sock;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, udp_sock, &ev) == -1) {
+    if (epoll_ctl(epollFd, EPOLL_CTL_ADD, udp_sock, &ev) == -1) {
         perror("epoll_ctl: udp_sock");
         exit(1);
     }
 
-    ev.events = EPOLLIN;
-    ev.data.fd = tcp_sock;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, tcp_sock, &ev) == -1) {
-        perror("epoll_ctl: tcp_sock");
-        exit(1);
-    }
-
-    struct sockaddr_in client_addr;
-    socklen_t client_addr_len = sizeof(client_addr);
+    struct sockaddr_in clientAddr;
+    socklen_t client_addr_len = sizeof(clientAddr);
     lastHealthCheckTime = chrono::high_resolution_clock::now();
     while (true) {
-        int nEvents = epoll_wait(epoll_fd, events, MAX_EVENTS, EPOLL_WAIT_TIMEOUT_MS); // block not more than for EPOLL_WAIT_TIMEOUT_MS ms
+        int nEvents = epoll_wait(epollFd, events, MAX_EVENTS, EPOLL_WAIT_TIMEOUT_MS); // block not more than for EPOLL_WAIT_TIMEOUT_MS ms
         if (nEvents == -1) {
             perror("epoll_wait");
             exit(1);
@@ -234,22 +274,36 @@ int main() {
         for (int i = 0; i < nEvents; ++i) {
             if (events[i].data.fd == udp_sock) {
                 memset(buffer, 0, BUFFER_SIZE);
-                recvfrom(udp_sock, buffer, BUFFER_SIZE, 0, (struct sockaddr *)&client_addr, &client_addr_len);
+                recvfrom(udp_sock, buffer, BUFFER_SIZE, 0, (struct sockaddr *)&clientAddr, &client_addr_len);
 
-                string workerAddress = inet_ntoa(client_addr.sin_addr);
-                workerAddress += ":";
-                workerAddress += to_string(ntohs(client_addr.sin_port));
-
-                cout << "Received heartbeat from client " << workerAddress << endl;
-
+                Address workerAddress = {inet_ntoa(clientAddr.sin_addr), ntohs(clientAddr.sin_port)};
                 workersStates[workerAddress].lastHeartbeat = currentTime;
-            } else {
 
+                cout << "Received heartbeat from client " << workerAddress.first << ":" << workerAddress.second << endl;
+            } else {
+                int sockFd = events[i].data.fd;
+                TaskResult taskResult;
+                if (getpeername(sockFd, (struct sockaddr*)&clientAddr, &client_addr_len) == -1) {
+                    perror("getpeername");
+                }
+                Address workerAddress = {inet_ntoa(clientAddr.sin_addr), ntohs(clientAddr.sin_port)};
+                int len = read(sockFd, &taskResult, sizeof(taskResult));
+                if (len > 0) {
+                    CompleteTask(taskResult);
+                    workersStates[workerAddress].tasksIds.clear();
+                } else {
+                    if (epoll_ctl(epollFd, EPOLL_CTL_DEL, sockFd, NULL) == -1) {
+                        perror("epoll_ctl: DEL");
+                    }
+                    close(sockFd);
+                    cout << "Closed connection with client" << endl;
+                }
             }
         }
 
         if (!taskSplitted && DiffBetweenTimestamps(timeOfBroadcast, currentTime) >= workersConnectionWaitingTime) {
             TryToCreateSubtasks(timeOfBroadcast, currentTime);
+            cerr << "TryToCreateSubtasks finished" << endl;
         }
 
         if (taskSplitted && DiffBetweenTimestamps(lastHealthCheckTime, currentTime) > healthCheckPeriod) {
@@ -258,6 +312,5 @@ int main() {
     }
 
     close(udp_sock);
-    close(tcp_sock);
-    close(epoll_fd);
+    close(epollFd);
 }
