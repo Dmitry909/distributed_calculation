@@ -50,6 +50,17 @@ const int EPOLL_WAIT_TIMEOUT_MS = 500;
 bool taskSplitted = false;
 unordered_set<size_t> completedTasks;
 double totalResult = 0;
+struct epoll_event ev, events[MAX_EVENTS];
+int epollFd;
+int udp_sock;
+
+void CloseAllSocks() {
+    close(udp_sock);
+    close(epollFd);
+    for (const auto& [_, state] : workersStates) {
+        close(state.tcpSock);
+    }
+}
 
 int SetNonblocking(int sockfd) {
     int flags, s;
@@ -93,36 +104,6 @@ int CreateAndBindUdp(int port) {
     return sockfd;
 }
 
-int CreateAndBindTcp(int port) { // TODO удалить либо это, либо SetTcpConnectionWithWorker
-    int sockfd;
-    struct sockaddr_in server_addr;
-
-    if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("TCP socket creation failed");
-        exit(1);
-    }
-
-    memset(&server_addr, 0, sizeof(server_addr));
-
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(port);
-
-    if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("TCP bind failed");
-        close(sockfd);
-        exit(1);
-    }
-
-    if (listen(sockfd, 10) < 0) {
-        perror("Listen failed");
-        close(sockfd);
-        exit(1);
-    }
-
-    return sockfd;
-}
-
 bool SetTcpConnectionWithWorker(const Address& workerAddress) {
     auto& workerState = workersStates[workerAddress];
     workerState.tcpSock = socket(AF_INET, SOCK_STREAM, 0);
@@ -140,6 +121,15 @@ bool SetTcpConnectionWithWorker(const Address& workerAddress) {
         // close(workerState.tcpSock);
         return false;
     }
+
+    ev.events = EPOLLIN | EPOLLET;
+    ev.data.fd = workerState.tcpSock;
+    if (epoll_ctl(epollFd, EPOLL_CTL_MOD, workerState.tcpSock, &ev) == -1) {
+        perror("epoll_ctl: mod");
+        close(workerState.tcpSock);
+        exit(1);
+    }
+
     return true;
 }
 
@@ -225,6 +215,7 @@ void CompleteTask(TaskResult result) {
         totalResult += result.result;
         if (completedTasks.size() == tasksCount) {
             cout << "Result: " << totalResult << endl;
+            CloseAllSocks();
             exit(0);
         }
     }
@@ -241,17 +232,14 @@ int main() {
     // workersStates = {"1.2.3.4:5555", "5.6.7.8:5555", "9.10.11.12:5555"};
     const auto timeOfBroadcast = chrono::high_resolution_clock::now();
 
-    int udp_sock;
     udp_sock = CreateAndBindUdp(PORT);
     SetNonblocking(udp_sock);
 
-    int epollFd = epoll_create1(0);
+    epollFd = epoll_create1(0);
     if (epollFd == -1) {
         perror("epoll_create1");
         exit(1);
     }
-
-    struct epoll_event ev, events[MAX_EVENTS];
     
     ev.events = EPOLLIN;
     ev.data.fd = udp_sock;
@@ -277,9 +265,12 @@ int main() {
                 recvfrom(udp_sock, buffer, BUFFER_SIZE, 0, (struct sockaddr *)&clientAddr, &client_addr_len);
 
                 Address workerAddress = {inet_ntoa(clientAddr.sin_addr), ntohs(clientAddr.sin_port)};
-                workersStates[workerAddress].lastHeartbeat = currentTime;
-
                 cout << "Received heartbeat from client " << workerAddress.first << ":" << workerAddress.second << endl;
+                if (!workersStates.contains(workerAddress)) {
+                    bool success = SetTcpConnectionWithWorker(workerAddress);
+                    cerr << "tried to set tcp connection with worker, result: " << success << endl;
+                }
+                workersStates[workerAddress].lastHeartbeat = currentTime;
             } else {
                 int sockFd = events[i].data.fd;
                 TaskResult taskResult;
@@ -291,13 +282,14 @@ int main() {
                 if (len > 0) {
                     CompleteTask(taskResult);
                     workersStates[workerAddress].tasksIds.clear();
-                } else {
-                    if (epoll_ctl(epollFd, EPOLL_CTL_DEL, sockFd, NULL) == -1) {
-                        perror("epoll_ctl: DEL");
-                    }
-                    close(sockFd);
-                    cout << "Closed connection with client" << endl;
                 }
+                // else {
+                //     if (epoll_ctl(epollFd, EPOLL_CTL_DEL, sockFd, NULL) == -1) {
+                //         perror("epoll_ctl: DEL");
+                //     }
+                //     close(sockFd);
+                //     cout << "Closed connection with client" << endl;
+                // }
             }
         }
 
@@ -311,6 +303,5 @@ int main() {
         }
     }
 
-    close(udp_sock);
-    close(epollFd);
+    CloseAllSocks();
 }
