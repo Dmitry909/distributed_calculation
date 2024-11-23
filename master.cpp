@@ -13,18 +13,9 @@
 #include <vector>
 #include <cassert>
 
+#include "task.h"
+
 using namespace std;
-
-struct Task {
-    size_t taskId;
-    double l;
-    double r;
-};
-
-struct TaskResult {
-    size_t taskId;
-    double result;
-};
 
 using TimeType = chrono::time_point<chrono::high_resolution_clock>;
 struct WorkerState {
@@ -53,6 +44,41 @@ double totalResult = 0;
 struct epoll_event ev, events[MAX_EVENTS];
 int epollFd;
 int udp_sock;
+const double numberOfSteps = 1e11;
+
+void SendBroadcast(unsigned short broadcastPort) {
+    int sock;
+    struct sockaddr_in broadcast_addr;
+    string broadcastIp = "192.168.1.255";
+    string message = "Broadcast to calculate the integral";
+    int broadcastPermission = 1;
+
+    if ((sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
+        perror("broadcast socket creation failed");
+        exit(1);
+    }
+
+    if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcastPermission, sizeof(broadcastPermission)) < 0) {
+        perror("broadcast setsockopt failed");
+        close(sock);
+        exit(1);
+    }
+
+    memset(&broadcast_addr, 0, sizeof(broadcast_addr));
+    broadcast_addr.sin_family = AF_INET;
+    broadcast_addr.sin_addr.s_addr = inet_addr(broadcastIp.data());
+    broadcast_addr.sin_port = htons(broadcastPort);
+
+    if (sendto(sock, message.data(), strlen(message.data()), 0, (struct sockaddr *) &broadcast_addr, sizeof(broadcast_addr)) != strlen(message.data())) {
+        perror("broadcast sendto failed");
+        close(sock);
+        exit(1);
+    }
+
+    cout << "Broadcast message sent: " << message << endl;
+
+    close(sock);
+}
 
 void CloseAllSocks() {
     close(udp_sock);
@@ -62,16 +88,16 @@ void CloseAllSocks() {
     }
 }
 
-int SetNonblocking(int sockfd) {
+int SetNonblocking(int sockFd) {
     int flags, s;
-    flags = fcntl(sockfd, F_GETFL, 0);
+    flags = fcntl(sockFd, F_GETFL, 0);
     if (flags == -1) {
         perror("fcntl");
         exit(1); // TODO exit?
     }
 
     flags |= O_NONBLOCK;
-    s = fcntl(sockfd, F_SETFL, flags);
+    s = fcntl(sockFd, F_SETFL, flags);
     if (s == -1) {
         perror("fcntl");
         exit(1); // TODO exit?
@@ -81,10 +107,10 @@ int SetNonblocking(int sockfd) {
 }
 
 int CreateAndBindUdp(int port) {
-    int sockfd;
+    int sockFd;
     struct sockaddr_in server_addr;
 
-    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+    if ((sockFd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("UDP socket creation failed");
         exit(1);
     }
@@ -95,13 +121,13 @@ int CreateAndBindUdp(int port) {
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(port);
 
-    if (bind(sockfd, (const struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+    if (bind(sockFd, (const struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("UDP bind failed");
-        close(sockfd);
+        close(sockFd);
         exit(1);
     }
 
-    return sockfd;
+    return sockFd;
 }
 
 bool SetTcpConnectionWithWorker(const Address& workerAddress) {
@@ -137,7 +163,7 @@ Task GetSubInterval(size_t i) {
     if (tasksCount == 0) {
         return {0, 0};
     }
-    return {i, l + (r - l) / tasksCount * i, l + (r - l) / tasksCount * (i + 1)};
+    return {i, l + (r - l) / tasksCount * i, l + (r - l) / tasksCount * (i + 1), (r - l) / numberOfSteps / tasksCount};
 }
 
 void AssignAndSendTaskToWorker(const Address& workerAddress, size_t taskId) {
@@ -228,8 +254,8 @@ int main() {
         exit(1);
     }
 
-    // TODO get workersStates using broadcast. Далее в epoll-е еще придется ждать таймаут, чтобы пришло определенное число воркеров.
-    // workersStates = {"1.2.3.4:5555", "5.6.7.8:5555", "9.10.11.12:5555"};
+    SendBroadcast(4567);
+    exit(0);
     const auto timeOfBroadcast = chrono::high_resolution_clock::now();
 
     udp_sock = CreateAndBindUdp(PORT);
