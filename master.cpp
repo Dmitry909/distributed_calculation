@@ -11,6 +11,7 @@
 #include <netinet/in.h>
 #include <chrono>
 #include <vector>
+#include <cassert>
 
 using namespace std;
 
@@ -19,9 +20,10 @@ struct Task {
     double r;
 };
 
+using TimeType = chrono::time_point<chrono::high_resolution_clock>;
 struct WorkerState {
     unordered_set<size_t> tasksIds;
-    chrono::time_point<chrono::high_resolution_clock> lastHeartbeat;
+    TimeType lastHeartbeat;
 };
 
 size_t tasksCount = 0;
@@ -34,8 +36,9 @@ const size_t BUFFER_SIZE = 1024; // а больше не надо? что буд
 char buffer[BUFFER_SIZE];
 const double healthCheckPeriod = 10; // seconds
 double workersConnectionWaitingTime = healthCheckPeriod / 2;
-chrono::time_point<chrono::high_resolution_clock> lastHealthCheckTime;
+TimeType lastHealthCheckTime;
 const int EPOLL_WAIT_TIMEOUT_MS = 500;
+bool taskSplitted = false;
 
 int SetNonblocking(int sockfd) {
     int flags, s;
@@ -125,8 +128,57 @@ Task GetSubInterval(size_t i) {
     return {l + (r - l) / tasksCount * i, l + (r - l) / tasksCount * (i + 1)};
 }
 
-double DiffBetweenTimestamps(chrono::time_point<chrono::high_resolution_clock> a, chrono::time_point<chrono::high_resolution_clock> b) {
+double DiffBetweenTimestamps(const TimeType& a, const TimeType& b) {
+    assert(a > b);
     return (chrono::duration<double>(b - a)).count();
+}
+
+void TryToCreateSubtasks(const TimeType& timeOfBroadcast, const TimeType& currentTime) {
+    cout << DiffBetweenTimestamps(timeOfBroadcast, currentTime) << endl;
+    if (workersStates.empty()) {
+        workersConnectionWaitingTime *= 2;
+    } else {
+        tasksCount = workersStates.size();
+        taskSplitted = true;
+        size_t i = 0;
+        for (auto& [worker, state] : workersStates) {
+            SetTcpConnectionWithWorkek(worker);
+            AssignAndSendTaskToWorker(worker, i++);
+        }
+    }
+}
+
+void DoHealthCheck() {
+    auto currentTime = chrono::high_resolution_clock::now();
+    lastHealthCheckTime = currentTime;
+    vector<string> aliveWorkersAddresses;
+    vector<size_t> tasksToReassign;
+    for (auto& [workerAddress, state] : workersStates) {
+        if (DiffBetweenTimestamps(state.lastHeartbeat, currentTime) > healthCheckPeriod) {
+            cerr << "Dead: " << workerAddress << std::endl;
+            tasksToReassign.insert(
+                tasksToReassign.begin(),
+                make_move_iterator(state.tasksIds.begin()),
+                make_move_iterator(state.tasksIds.end())
+            );
+            state.tasksIds.clear();
+        } else {
+            cerr << "Alive: " << workerAddress << std::endl;
+            aliveWorkersAddresses.push_back(workerAddress);
+        }
+    }
+    if (aliveWorkersAddresses.empty()) {
+        cerr << "No alive workers :(" << endl;
+    } else {
+        size_t newTasksPerWorker = tasksToReassign.size() / aliveWorkersAddresses.size();
+        size_t indexOfWorker = 0;
+        for (size_t i = 0; i < tasksToReassign.size(); ++i) {
+            if (i > 0 && i % newTasksPerWorker == 0) {
+                ++indexOfWorker;
+            }
+            AssignAndSendTaskToWorker(aliveWorkersAddresses[indexOfWorker], tasksToReassign[i]);
+        }
+    }
 }
 
 int main() {
@@ -170,7 +222,6 @@ int main() {
 
     struct sockaddr_in client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
-    bool task_splitted = false;
     lastHealthCheckTime = chrono::high_resolution_clock::now();
     while (true) {
         int nEvents = epoll_wait(epoll_fd, events, MAX_EVENTS, EPOLL_WAIT_TIMEOUT_MS); // block not more than for EPOLL_WAIT_TIMEOUT_MS ms
@@ -193,55 +244,16 @@ int main() {
 
                 workersStates[workerAddress].lastHeartbeat = currentTime;
             } else {
-                
+
             }
         }
 
-        if (!task_splitted && DiffBetweenTimestamps(timeOfBroadcast, currentTime) >= workersConnectionWaitingTime) {
-            cout << DiffBetweenTimestamps(timeOfBroadcast, currentTime) << endl;
-            if (workersStates.empty()) {
-                workersConnectionWaitingTime *= 2;
-            } else {
-                tasksCount = workersStates.size();
-                task_splitted = true;
-                size_t i = 0;
-                for (auto& [worker, state] : workersStates) {
-                    SetTcpConnectionWithWorkek(worker);
-                    AssignAndSendTaskToWorker(worker, i++);
-                }
-            }
+        if (!taskSplitted && DiffBetweenTimestamps(timeOfBroadcast, currentTime) >= workersConnectionWaitingTime) {
+            TryToCreateSubtasks(timeOfBroadcast, currentTime);
         }
 
-        if (task_splitted && DiffBetweenTimestamps(lastHealthCheckTime, currentTime) > healthCheckPeriod) {
-            lastHealthCheckTime = currentTime;
-            vector<string> aliveWorkersAddresses;
-            vector<size_t> tasksToReassign;
-            for (auto& [workerAddress, state] : workersStates) {
-                if (DiffBetweenTimestamps(state.lastHeartbeat, currentTime) > healthCheckPeriod) {
-                    cerr << "Dead: " << workerAddress << std::endl;
-                    tasksToReassign.insert(
-                        tasksToReassign.begin(),
-                        make_move_iterator(state.tasksIds.begin()),
-                        make_move_iterator(state.tasksIds.end())
-                    );
-                    state.tasksIds.clear();
-                } else {
-                    cerr << "Alive: " << workerAddress << std::endl;
-                    aliveWorkersAddresses.push_back(workerAddress);
-                }
-            }
-            if (aliveWorkersAddresses.empty()) {
-                cerr << "No alive workers :(" << endl;
-            } else {
-                size_t newTasksPerWorker = tasksToReassign.size() / aliveWorkersAddresses.size();
-                size_t indexOfWorker = 0;
-                for (size_t i = 0; i < tasksToReassign.size(); ++i) {
-                    if (i > 0 && i % newTasksPerWorker == 0) {
-                        ++indexOfWorker;
-                    }
-                    AssignAndSendTaskToWorker(aliveWorkersAddresses[indexOfWorker], tasksToReassign[i]);
-                }
-            }
+        if (taskSplitted && DiffBetweenTimestamps(lastHealthCheckTime, currentTime) > healthCheckPeriod) {
+            DoHealthCheck();
         }
     }
 
