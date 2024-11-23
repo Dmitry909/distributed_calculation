@@ -30,7 +30,8 @@ double l;
 double r;
 using Address = pair<string, uint16_t>;
 map<Address, WorkerState> workersStates;
-const size_t PORT = 12345;
+const size_t UDP_PORT = 3456;
+const size_t TCP_PORT = 3457;
 const size_t MAX_EVENTS = 100;
 const size_t BUFFER_SIZE = 1024; // а больше не надо? что будет если не хватит на одно сообщение?
 char buffer[BUFFER_SIZE];
@@ -93,14 +94,13 @@ int SetNonblocking(int sockFd) {
     flags = fcntl(sockFd, F_GETFL, 0);
     if (flags == -1) {
         perror("fcntl");
-        exit(1); // TODO exit?
+        exit(1);
     }
-
     flags |= O_NONBLOCK;
     s = fcntl(sockFd, F_SETFL, flags);
     if (s == -1) {
         perror("fcntl");
-        exit(1); // TODO exit?
+        exit(1);
     }
 
     return 0;
@@ -258,7 +258,7 @@ int main() {
     exit(0);
     const auto timeOfBroadcast = chrono::high_resolution_clock::now();
 
-    udp_sock = CreateAndBindUdp(PORT);
+    udp_sock = CreateAndBindUdp(UDP_PORT);
     SetNonblocking(udp_sock);
 
     epollFd = epoll_create1(0);

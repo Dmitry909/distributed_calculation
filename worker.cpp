@@ -35,9 +35,15 @@ double calcOnInterval(double l, double r, double step) {
 }
 
 const size_t BUFFER_SIZE = 1024;
+const size_t UDP_PORT = 3456;
+const size_t TCP_PORT = 3457;
 string masterAddress;
+int tcpSock;
+int udpSock;
+struct sockaddr_in tcpAddr;
+struct sockaddr_in udpAddr;
 
-void GetBroadcastMessage(unsigned short broadcastPort) {
+void GetBroadcast(unsigned short broadcastPort) {
     int sockFd;
     struct sockaddr_in addr;
     socklen_t addr_len = sizeof(addr);
@@ -83,6 +89,57 @@ void GetBroadcastMessage(unsigned short broadcastPort) {
     close(sockFd);
 }
 
+void SetupTcp() {
+    tcpSock = socket(AF_INET, SOCK_STREAM, 0);
+    if (tcpSock < 0) {
+        perror("TCP socket creation failed");
+        exit(1);
+    }
+
+    tcpAddr.sin_family = AF_INET;
+    tcpAddr.sin_port = htons(TCP_PORT);
+    inet_pton(AF_INET, masterAddress.data(), &tcpAddr.sin_addr);
+
+    if (bind(tcpSock, (struct sockaddr*)&tcpAddr, sizeof(tcpAddr)) < 0) {
+        perror("bind");
+        close(tcpSock);
+        exit(1);
+    }
+
+    if (listen(tcpSock, 1) < 0) {
+        perror("listen");
+        close(tcpSock);
+        exit(1);
+    }
+
+    int flags = fcntl(tcpSock, F_GETFL, 0);
+    if (flags == -1) {
+        perror("fcntl");
+        exit(1);
+    }
+    fcntl(tcpSock, F_SETFL, flags | O_NONBLOCK);
+}
+
+void SetupUdp() {
+    udpSock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udpSock < 0) {
+        perror("socket");
+        exit(1);
+    }
+
+    udpAddr.sin_family = AF_INET;
+    udpAddr.sin_port = htons(UDP_PORT);
+    inet_pton(AF_INET, masterAddress.data(), &udpAddr.sin_addr);
+}
+
 int main() {
-    GetBroadcastMessage(4567);
+    GetBroadcast(4567);
+
+    // сначала сделать SetupTcp и начать принимать соединения, чтобы не пропустить подключение.
+    SetupUdp();
+    while (true) {
+        // прочитать из tcp буфера, если что-то пришло то начать выполнять задачу с фьючой.
+
+        // если прошло кратное таймауту время, отправить heartbeat по UDP.
+    }
 }
